@@ -33,7 +33,8 @@ function bashunit::console_results::print_successful_test() {
   local full_line=$line
   if bashunit::env::is_show_execution_time_enabled; then
     bashunit::console_results::format_duration_to_slot "$duration"
-    full_line="$(bashunit::str::rpad "$line" "$_BASHUNIT_CONSOLE_DURATION_OUT")"
+    bashunit::str::rpad_to_slot "$line" "$_BASHUNIT_CONSOLE_DURATION_OUT"
+    full_line=$_BASHUNIT_STR_RPAD_OUT
   fi
 
   bashunit::console_results::print_line "successful" "$full_line"
@@ -46,6 +47,7 @@ function bashunit::console_results::print_successful_test() {
 # is unknown. Used to append source context to failure output.
 ##
 function bashunit::console_results::test_location_suffix() {
+  bashunit::runner::ensure_test_location
   local location=${_BASHUNIT_TEST_LOCATION:-}
   if [ -z "$location" ]; then
     return 0
@@ -235,9 +237,9 @@ function bashunit::console_results::print_risky_test() {
 
   local full_line=$line
   if bashunit::env::is_show_execution_time_enabled; then
-    local time_display
-    time_display=$(bashunit::console_results::format_duration "$duration")
-    full_line="$(bashunit::str::rpad "$line" "$time_display")"
+    bashunit::console_results::format_duration_to_slot "$duration"
+    bashunit::str::rpad_to_slot "$line" "$_BASHUNIT_CONSOLE_DURATION_OUT"
+    full_line=$_BASHUNIT_STR_RPAD_OUT
   fi
 
   bashunit::console_results::print_line "risky" "$full_line"
@@ -283,11 +285,21 @@ function bashunit::console_results::print_worker_stderr() {
   local test_file="$1"
   local stderr_file="$2"
 
+  # Not the file's output: the worker turns on job control so each test is its
+  # own process group, and bash's parent-side setpgid loses a harmless race
+  # against a child that already exec'd. The child set the group itself before
+  # exec, so the group is right and only the diagnostic is wrong -- but bash
+  # reports every errno except ESRCH, and macOS answers EPERM.
+  local noise='child setpgid ('
+
+  # Nothing but noise means no block at all, so a clean run stays quiet.
+  grep -qv "$noise" "$stderr_file" || return 0
+
   # To stderr, which is where this text came from: on stdout it landed ahead of
   # the document `--output json|junit` promises that stream is, so a worker that
   # wrote anything to stderr -- a failing `set_up`, for one -- made the report
   # unparseable.
   printf "\n%sStderr from %s%s\n" \
     "$_BASHUNIT_COLOR_SKIPPED" "$test_file" "$_BASHUNIT_COLOR_DEFAULT" >&2
-  sed 's/^/|/' "$stderr_file" >&2
+  grep -v "$noise" "$stderr_file" | sed 's/^/|/' >&2
 }

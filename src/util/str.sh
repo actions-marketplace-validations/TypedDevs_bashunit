@@ -16,6 +16,33 @@ function bashunit::random_str() {
   echo "$str"
 }
 
+_BASHUNIT_STR_LPAD_OUT=""
+
+##
+# Right-aligns $2 in a field of $1 characters, into _BASHUNIT_STR_LPAD_OUT.
+#
+# The first version-gated helper in the tree, and the shape every later one
+# follows: a column-0 `if/else` on a flag from src/system/bash.sh, two bodies,
+# one picked at load time. See adrs/adr-013-bash-version-gated-fast-paths.md.
+#
+# `printf -v` is Bash 3.1, and writing into a variable is the whole difference:
+# the 3.0 body has to capture, which forks. Both bodies hand the same format
+# and the same value to the same `printf`, so the padded result is identical
+# by construction -- the only thing the gate changes is the fork. A gate that
+# changed what came out would be a bug, not an optimisation.
+#
+# Arguments: $1 - the field width, $2 - the value to pad
+##
+if [ "$_BASHUNIT_BASH_GE_31" = 1 ]; then
+  function bashunit::str::lpad_to_slot() {
+    printf -v _BASHUNIT_STR_LPAD_OUT "%${1}s" "$2"
+  }
+else
+  function bashunit::str::lpad_to_slot() {
+    _BASHUNIT_STR_LPAD_OUT=$(printf "%${1}s" "$2")
+  }
+fi
+
 # Strip ANSI escape codes and control characters, writing the result into the
 # global slot _BASHUNIT_STR_STRIPPED_OUT (no fork on the plain-text fast path).
 # Callers on hot paths (assert_equals/assert_not_equals) use this to avoid the
@@ -89,7 +116,21 @@ function bashunit::str::strip_ansi() {
   echo "$_BASHUNIT_STR_STRIPPED_OUT"
 }
 
-function bashunit::str::rpad() {
+# A run of spaces, doubled on demand. Padding is a slice of it, because the
+# only fork-free `printf` into a variable is `printf -v`, which is Bash 3.1
+# and this project floors at 3.0.
+_BASHUNIT_STR_SPACES="        "
+_BASHUNIT_STR_RPAD_OUT=""
+
+##
+# Return-slot variant of rpad: writes the padded line into
+# _BASHUNIT_STR_RPAD_OUT, without the trailing newline `$( )` used to strip.
+#
+# This runs once per passing test wherever per-test timing is on, and the
+# function was already fork-free inside -- the capture subshell around it was
+# the entire cost (#1348).
+##
+function bashunit::str::rpad_to_slot() {
   local left_text="$1"
   local right_word="$2"
   local width_padding="${3:-$TERMINAL_WIDTH}"
@@ -156,7 +197,18 @@ function bashunit::str::rpad() {
     remaining_space=0
   fi
 
-  printf "%s%${remaining_space}s %s\n" "$result_left_text" "" "$right_word"
+  while [ ${#_BASHUNIT_STR_SPACES} -lt "$remaining_space" ]; do
+    _BASHUNIT_STR_SPACES="$_BASHUNIT_STR_SPACES$_BASHUNIT_STR_SPACES"
+  done
+
+  _BASHUNIT_STR_RPAD_OUT="${result_left_text}${_BASHUNIT_STR_SPACES:0:$remaining_space} $right_word"
+}
+
+# Pads and echoes the result. Thin wrapper over the return-slot variant, the
+# same shape strip_ansi has over strip_ansi_to_slot.
+function bashunit::str::rpad() {
+  bashunit::str::rpad_to_slot "$@"
+  echo "$_BASHUNIT_STR_RPAD_OUT"
 }
 
 ##

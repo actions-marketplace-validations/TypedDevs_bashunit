@@ -426,6 +426,44 @@ These lines are not counted toward coverage:
 - Control flow keywords (`then`, `else`, `fi`, `do`, `done`, `esac`, `in`)
 - Case statement patterns (`--option)`, `*)`) and terminators (`;;`, `;&`, `;;&`)
 
+### Statements That Span Several Lines
+
+Bash reports one executed statement to the tracer on a single line, even when
+the statement is written over several. bashunit propagates that hit across the
+statement's physical span, so every executable line in a statement that ran is
+covered:
+
+- backslash continuations (`printf '%s' \` … )
+- array literals (`commands=(` … `)`)
+- multi-line quoted strings
+- heredoc bodies (`cat <<EOF` … `EOF`)
+
+```bash
+commands=(          # covered
+  "start"           # covered
+  "stop"            # covered
+)                   # not executable
+```
+
+Executable lines remain in the denominator, so an unexecuted multiline
+statement can contribute several uncovered lines.
+
+Parent statement hits do not cover commands inside a multi-line command or
+process substitution, even when the substitution appears inside a quoted string
+or array:
+
+```bash
+result=$(
+  compute_a
+  compute_b
+)
+```
+
+Crediting `compute_a` and `compute_b` from the line that opened the substitution
+would report lines that never ran. Multiline literals inside the substitution
+still receive coverage from their own execution. (Before Bash 4 the tracer does
+not reach a subshell at all; see [Subshell Behavior](#subshell-behavior).)
+
 ## Branch Coverage
 
 Beyond line and function coverage, bashunit emits **branch coverage** records in the LCOV report so reviewers can see whether each `else`/`elif` arm and each `case` pattern was exercised. Branch records are produced automatically; no extra flags are needed.

@@ -282,3 +282,118 @@ function test_reports_do_not_fork_base64_per_field() {
   # that, with room for the run's own bookkeeping; it was 56.
   assert_less_or_equal_than 16 "$calls"
 }
+
+# Regression guard for the per-test hook path. A test in a file that defines
+# `set_up` or `tear_down` used to cost five process forks: each hook minted its
+# output file with `mktemp` and removed it with `rm -f`, and the temp-owner
+# marker `mktemp` left behind made the EXIT trap `rm -rf` the test's temp files
+# even when the test itself created none. That is 3.3x the cost of a hookless
+# test (28.3ms vs 8.5ms). The hook output file is named arithmetically inside
+# the run directory now, and the `>` redirect truncates it, so a hooked test
+# forks neither binary — only the run's own single `rm` of its scratch dir
+# remains.
+function test_test_hooks_do_not_fork_mktemp_or_rm_per_test() {
+  if bashunit::check_os::is_windows; then
+    bashunit::skip "PATH shims are unreliable under Git Bash" && return
+  fi
+
+  local dir
+  dir="$(bashunit::temp_dir)"
+  local count_file="$dir/count"
+  local bin
+  for bin in mktemp rm; do
+    local real_bin
+    real_bin="$(command -v "$bin")"
+    {
+      echo '#!/usr/bin/env bash'
+      echo "echo $bin >> \"$count_file\""
+      echo "exec \"$real_bin\" \"\$@\""
+    } >"$dir/$bin"
+    chmod +x "$dir/$bin"
+  done
+
+  local fixture="$dir/hook_forks_test.sh"
+  {
+    echo 'function set_up() { :; }'
+    echo 'function tear_down() { :; }'
+    echo 'function test_a() { assert_true true; }'
+    echo 'function test_b() { assert_true true; }'
+    echo 'function test_c() { assert_true true; }'
+    echo 'function test_d() { assert_true true; }'
+  } >"$fixture"
+
+  PATH="$dir:$PATH" ./bashunit --no-parallel "$fixture" >/dev/null 2>&1
+
+  local mktemp_forks=0
+  local rm_forks=0
+  if [ -f "$count_file" ]; then
+    mktemp_forks="$(grep -c '^mktemp$' "$count_file" || true)"
+    rm_forks="$(grep -c '^rm$' "$count_file" || true)"
+  fi
+
+  assert_equals 0 "$mktemp_forks"
+  # The run's own scratch-dir cleanup, and nothing per test.
+  assert_less_or_equal_than 1 "$rm_forks"
+}
+
+# Regression guard for the parallel clock probe. Resolving the clock
+# implementation used to happen inside a `$( )`, so the resolved value died
+# with that subshell and every --parallel worker re-probed. On a shell without
+# EPOCHREALTIME the probe forks `perl`, so the count scaled one-for-one with
+# the tests: 502 execs for a 500-test file against 2 (#1353). It fired even
+# with per-test timing off, because deciding that timing is off is what asks
+# whether the clock is expensive, which resolves the impl.
+#
+# Asserted as a differential rather than a budget: on a platform whose clock is
+# `EPOCHREALTIME` or `date` this forks no `perl` at all, and comparing two sizes
+# still fails loudly if the count ever starts tracking the test count.
+function test_parallel_clock_probes_do_not_scale_with_the_test_count() {
+  if bashunit::check_os::is_windows; then
+    bashunit::skip "PATH shims are unreliable under Git Bash" && return
+  fi
+
+  local dir
+  dir="$(bashunit::temp_dir)"
+  local count_file="$dir/perl_calls"
+  local real_perl
+  real_perl="$(command -v perl)"
+  if [ -z "$real_perl" ]; then
+    bashunit::skip "no perl on this machine to shim" && return
+  fi
+
+  {
+    echo '#!/usr/bin/env bash'
+    echo "echo x >>\"$count_file\""
+    echo "exec \"$real_perl\" \"\$@\""
+  } >"$dir/perl"
+  chmod +x "$dir/perl"
+
+  local few="$dir/few_test.sh"
+  local many="$dir/many_test.sh"
+  local i=0
+  : >"$few"
+  while [ $i -lt 5 ]; do
+    echo "function test_f$i() { assert_true true; }" >>"$few"
+    i=$((i + 1))
+  done
+  i=0
+  : >"$many"
+  while [ $i -lt 40 ]; do
+    echo "function test_m$i() { assert_true true; }" >>"$many"
+    i=$((i + 1))
+  done
+
+  : >"$count_file"
+  PATH="$dir:$PATH" ./bashunit --parallel "$few" >/dev/null 2>&1
+  local few_calls
+  few_calls="$(grep -c . "$count_file" || true)"
+
+  : >"$count_file"
+  PATH="$dir:$PATH" ./bashunit --parallel "$many" >/dev/null 2>&1
+  local many_calls
+  many_calls="$(grep -c . "$count_file" || true)"
+
+  # Eight times the tests must not cost more probes. Equality, not a budget:
+  # the run resolves the clock once whatever the size.
+  assert_same "$few_calls" "$many_calls"
+}

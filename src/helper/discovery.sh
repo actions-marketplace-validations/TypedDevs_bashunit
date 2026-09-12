@@ -86,9 +86,10 @@ EOF
 ##
 # Whether a function name matches any --exclude-filter value.
 #
-# The value is read from BASHUNIT_EXCLUDE_FILTER rather than passed in, so the
-# header count (which reaches get_functions_to_run from a subshell) and the
-# runner cannot end up applying different selections.
+# Configured values come from comma-separated BASHUNIT_EXCLUDE_FILTER. Repeated
+# CLI values live in a dynamically scoped array so each argument stays literal.
+# Both are inherited by the header-count subshell, keeping it aligned with the
+# runner without threading another argument through every call site.
 #
 # Locals are `__bu_`-prefixed (bash-style.md, PR #672). The only caller is
 # get_functions_to_run, and this runs inside its `for fn in ...` loop, so plain
@@ -101,13 +102,21 @@ function bashunit::helper::name_matches_exclude_filter() {
   local __bu_prefix=$1
   local __bu_fn=$2
 
-  if [ -z "${BASHUNIT_EXCLUDE_FILTER:-}" ]; then
+  if [ -z "${BASHUNIT_EXCLUDE_FILTER:-}" ] &&
+    [ -z "${_BASHUNIT_CLI_EXCLUDE_FILTERS[*]:-}" ]; then
     return 1
   fi
 
   local IFS=','
   local __bu_excl
-  for __bu_excl in $BASHUNIT_EXCLUDE_FILTER; do
+  for __bu_excl in ${BASHUNIT_EXCLUDE_FILTER:-}; do
+    __bu_excl=${__bu_excl/test_/}
+    if [ -n "$__bu_excl" ]; then
+      case "$__bu_fn" in ${__bu_prefix}_*${__bu_excl}*) return 0 ;; esac
+    fi
+  done
+
+  for __bu_excl in ${_BASHUNIT_CLI_EXCLUDE_FILTERS[@]+"${_BASHUNIT_CLI_EXCLUDE_FILTERS[@]}"}; do
     __bu_excl=${__bu_excl/test_/}
     if [ -n "$__bu_excl" ]; then
       case "$__bu_fn" in ${__bu_prefix}_*${__bu_excl}*) return 0 ;; esac
@@ -138,7 +147,11 @@ function bashunit::helper::get_functions_to_run() {
     fi
     if [ "$_fn_match" = true ]; then
       local _dup=false
-      case "$filtered_functions" in *" $fn"*) _dup=true ;; esac
+      # Both delimiters, or a name is "already present" whenever an earlier one
+      # merely starts with it: `test_a` reads as a duplicate of `test_ab`. That
+      # stayed hidden while the only caller fed this `compgen` output, which is
+      # sorted, so a prefix always arrived first (#1347).
+      case "$filtered_functions " in *" $fn "*) _dup=true ;; esac
       if [ "$_dup" = true ]; then
         return 1
       fi
@@ -197,6 +210,62 @@ function bashunit::helper::find_files_recursive() {
 _BASHUNIT_HELPER_VARNAME_OUT=""
 
 
+
+_BASHUNIT_HELPER_FILE_COUNT_OUT=0
+
+##
+# True when the provider map just built for a file is enough to count its
+# tests without sourcing it.
+#
+# Sourcing every file a second time, only to run `compgen -A function` in a
+# subshell, cost 671ms over this repo's 240 files before a single test ran, and
+# re-ran every data provider on the way (#1347). Two shapes still need it: a
+# provider's row count is only knowable by running it, and a file that could
+# define a test out of the scan's sight (eval, a nested source, a conditional
+# definition) would otherwise be undercounted -- a header that disagrees with
+# the run is worse than a slow one.
+##
+function bashunit::helper::_can_count_statically() {
+  if [ "$_BASHUNIT_PROVIDER_MAP_DYNAMIC" = true ]; then
+    return 1
+  fi
+
+  if [ "${#_BASHUNIT_PROVIDER_MAP_FNS[@]}" -ne 0 ]; then
+    return 1
+  fi
+
+  return 0
+}
+
+##
+# Counts the current provider map's test functions into
+# _BASHUNIT_HELPER_FILE_COUNT_OUT, applying the same selection the runner does.
+#
+# Every function without a provider is one test, which is what the sourcing
+# path counts too; only the names come from the scan rather than from
+# `compgen`. `get_functions_to_run` returns 1 on a duplicate name, exactly as
+# it does for the sourcing path, where `|| true` swallows it.
+#
+# Arguments: $1 - the --filter value
+##
+function bashunit::helper::_count_tests_statically() {
+  local filter=$1
+  # Set before the call, not after: get_functions_to_run word-splits its third
+  # argument with whatever IFS is current.
+  local IFS=$' \t\n'
+  local filtered_functions
+  filtered_functions=$(bashunit::helper::get_functions_to_run \
+    "test" "$filter" "$_BASHUNIT_PROVIDER_MAP_TEST_FNS") || true
+
+  local count=0
+  local fn
+  for fn in $filtered_functions; do
+    count=$((count + 1))
+  done
+
+  _BASHUNIT_HELPER_FILE_COUNT_OUT=$count
+}
+
 function bashunit::helper::find_total_tests() {
   local filter=${1:-}
   shift || true
@@ -221,8 +290,35 @@ function bashunit::helper::find_total_tests() {
     # file is a cache hit too — one awk scan per file instead of two.
     bashunit::helper::build_provider_map "$file"
 
-    local file_count
-    file_count=$( (
+    if bashunit::helper::_can_count_statically; then
+      bashunit::helper::_count_tests_statically "$filter"
+    else
+      bashunit::helper::_count_tests_by_sourcing "$file" "$filter"
+    fi
+    total_count=$((total_count + _BASHUNIT_HELPER_FILE_COUNT_OUT))
+  done
+
+  _BASHUNIT_HELPER_TOTAL_TESTS_OUT=$total_count
+  echo "$total_count"
+}
+
+##
+# Counts a file's tests into _BASHUNIT_HELPER_FILE_COUNT_OUT by sourcing it in
+# a subshell and asking `compgen`, then running each data provider to learn how
+# many rows it yields.
+#
+# The only way to count a provider, and the only way to see a function this
+# file defines through eval, a nested source or a condition. Everything else
+# takes the static path, because this one costs a double subshell, a re-source
+# and a second run of every provider in the suite (#1347).
+#
+# Arguments: $1 - the test file, $2 - the --filter value
+##
+function bashunit::helper::_count_tests_by_sourcing() {
+  local file=$1
+  local filter=$2
+
+  _BASHUNIT_HELPER_FILE_COUNT_OUT=$( (
       # shellcheck source=/dev/null
       source "$file"
       local all_fn_names
@@ -262,12 +358,6 @@ function bashunit::helper::find_total_tests() {
 
       echo "$count"
     ))
-
-    total_count=$((total_count + file_count))
-  done
-
-  _BASHUNIT_HELPER_TOTAL_TESTS_OUT=$total_count
-  echo "$total_count"
 }
 
 
@@ -409,4 +499,3 @@ _BASHUNIT_TAGS_MAP_SCRIPT=""
 _BASHUNIT_TAGS_MAP_FNS=()
 _BASHUNIT_TAGS_MAP_TAGS=()
 _BASHUNIT_TAGS_OUT=""
-

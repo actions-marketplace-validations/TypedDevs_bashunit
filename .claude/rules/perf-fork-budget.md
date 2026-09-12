@@ -186,9 +186,16 @@ them:
 
 - **Not forks.** A PATH-shim census over 30 binaries counts **12 forks for 500
   tests** (3 perl, 2 rm, 2 awk, and one each of uname/tput/mkdir/bc/base64).
-  The per-test path is genuinely fork-free.
+  The per-test path is genuinely fork-free -- but read the fixture before
+  trusting a census: this one defines no `set_up` or `tear_down`, and a file
+  that does used to cost five more forks per test (#1345), which is why that
+  never showed up here. A census fixture only measures the path it exercises.
 - **Not the capture subshell.** A bare `$( )` costs ~0.46 ms here, about 6% of
-  the 7.8 ms. The rest is bash work in the per-test machinery.
+  the 7.8 ms. The rest is bash work in the per-test machinery. That 0.46 ms
+  predates arm64 and must not be reused for estimates: the same measurement on
+  macOS arm64 (bash 3.2.57) is 1.1-1.4 ms, and a subshell that also runs
+  `shopt`/`declare` in it, 1.08 ms (#1346). A subshell per test is worth
+  removing on that hardware even when this note says it is not the bottleneck.
 - **Not quadratic.** Per-test cost is 7.17 ms at 100 tests and 8.06 ms at 1000
   -- +12% over a 10x range, so the #830 fn-accumulation fix still holds. A
   regression there would show as per-test cost climbing with suite size.
@@ -202,7 +209,9 @@ from them rather than re-deriving them.
 shell since #817, the header count reads a return slot so the cache survives
 into the runner — plus the duplicate check), `perl` ×2 clock reads (start/end;
 no `EPOCHREALTIME` before Bash 5), 1 `base64` capability probe, 1 `mkdir`,
-1 `tput`. Per-test cost is fork-free.
+1 `tput`. Per-test cost is fork-free, hooks included: `set_up`/`tear_down`
+capture their output in a run-dir file named from the folded file path and the
+per-suite ordinal, so no `mktemp` mints it and no `rm` removes it (#1345).
 
 **Cold start: 3 binary forks** — `uname` (OS detect), `tput` (snapshot width),
 `perl` (clock before Bash 5). It was 5 until #1124: `check_os::init` ran twice,
@@ -249,13 +258,35 @@ Verify such a rewrite by running both implementations over the same input
 that cannot fail proves nothing.
 
 **Parallel 10-test file run (CI's mode):** ~11 forks — 3 `mkdir`, 4 `rm`,
-3 `awk` (#813; was 61). The per-test result file is named by a per-suite
+3 `awk` (#813; was 61). That count was taken with a sequential census fixture
+and so missed the one cost that only exists in this mode: every worker used to
+re-probe the clock, because the probe resolved the implementation inside a
+`$( )` and the resolved value died with that subshell. On a shell without
+`EPOCHREALTIME` the probe forks `perl`, so it scaled one-for-one with the tests
+— 502 execs for a 500-test file against 2 — and it fired even with per-test
+timing off, since deciding that timing is off is what asks whether the clock is
+expensive (#1353). **Measure the parallel budget with a parallel fixture**: a
+per-worker cost is invisible to a sequential census by construction. The per-test result file is named by a per-suite
 ordinal the single-threaded dispatcher assigns just before each `&` (the fork
 inherits it), so it costs **no** `mktemp` + `mv` per test (#851; was 10
 `mktemp` + 10 `mv`). This replaced the old sanitized-test-name scheme, whose
 deterministic names could collide (different provider args sanitize identically)
-because Bash 3 workers can't mint a unique token — subshells inherit `$$` and
-the `RANDOM` state, and `BASHPID` is 4.0+; an ordinal sidesteps that entirely.
+because Bash 3 workers can't mint a unique token — subshells inherit `$$`, and
+`BASHPID` is 4.0+; an ordinal sidesteps that entirely.
+
+This file used to add "and the `RANDOM` state" to that list. Measured, `RANDOM`
+is neither reliably shared nor reliably reseeded (#1354):
+
+| Context | three consecutive `$( )` reads |
+|---|---|
+| Plain shell — 3.00.22, 3.2.57, 4.4, 5.2, 5.3 | differ |
+| `--parallel` worker — Linux 3.0, 5.2 | differ |
+| `--parallel` worker — macOS 3.2.57 | **identical** |
+
+So it depends on the platform *and* on how deeply nested the subshell is. Do
+not build on it in either direction, and do not reuse "`RANDOM` is shared" as a
+premise — it is right about the conclusion for the wrong reason. `$$` is the
+part that genuinely is inherited.
 `wait_for_job_slot` already uses `wait -n` on Bash 4.3+ and an adaptive
 sleep-poll fallback — don't "fix" it. The spinner forks `sleep` ~1/s on
 non-tty; not worth chasing.
