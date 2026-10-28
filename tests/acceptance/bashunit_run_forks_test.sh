@@ -1,6 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+function test_parallel_runs_do_not_start_a_spinner_without_visible_progress() {
+  local dir
+  dir="$(bashunit::temp_dir)"
+  local fixture="$dir/inactive_spinner_test.sh"
+  printf 'function test_without_spinner() { assert_same 1 1; }\n' >"$fixture"
+
+  local bootstrap="$dir/bootstrap.sh"
+  cat >"$bootstrap" <<'BOOTSTRAP'
+function bashunit::runner::spinner() {
+  printf 'started\n' >"$BASHUNIT_SPINNER_MARKER"
+}
+# Bash 3.0 cannot target names containing :: with declare -f.
+definition=$(declare -f | awk '
+  /^bashunit::state::aggregate_parallel_results \(\)/ { copy = 1 }
+  copy { print }
+  copy && /^}$/ { copy = 0 }
+')
+definition=${definition/bashunit::state::aggregate_parallel_results/bashunit_probe_aggregate}
+eval "$definition"
+function bashunit::state::aggregate_parallel_results() {
+  wait
+  bashunit_probe_aggregate "$@"
+}
+BOOTSTRAP
+
+  local mode output marker
+  local flags
+  for mode in normal no_progress json; do
+    flags=()
+    case "$mode" in
+    no_progress) flags=(--no-progress) ;;
+    json) flags=(--output json) ;;
+    esac
+    marker="$dir/$mode"
+    output=$(BASHUNIT_BOOTSTRAP="$bootstrap" BASHUNIT_SPINNER_MARKER="$marker" \
+      ./bashunit --parallel --simple --skip-env-file ${flags+"${flags[@]}"} "$fixture" 2>&1)
+    assert_successful_code "$?"
+    assert_file_not_exists "$marker"
+    case "$mode" in
+    json) assert_contains '"passed": 1' "$output" ;;
+    *) assert_contains '1 passed' "$output" ;;
+    esac
+  done
+}
+
 # Regression guard for the per-file run path. Running a test file used to fork
 # `grep` twice: once in the runner to scan sourcing stderr for "syntax error"/
 # "unexpected EOF", and once in discovery to decide whether to also match the
@@ -159,10 +204,72 @@ function test_running_a_test_file_stays_within_the_awk_fork_budget() {
   assert_less_or_equal_than 2 "$awk_forks"
 }
 
-# Regression guard: a run must remove its run-output scratch directory on exit.
-# The directory (introduced in #801 under $TMPDIR/bashunit/run/) had no cleanup,
-# leaking one empty directory per bashunit invocation. Point the nested run at a
-# private TMPDIR so the check is deterministic and parallel-safe.
+# Each mode needs its own temp owner when the acceptance suite runs in parallel.
+function _assert_multifile_metadata_scan_budget() {
+  if bashunit::check_os::is_windows; then
+    bashunit::skip "PATH shims are unreliable under Git Bash" && return
+  fi
+
+  local mode=$1 expected=$2 dir real_awk count_file file
+  dir="$(bashunit::temp_dir)"
+  count_file="$dir/awk_count"
+  : >"$count_file"
+  real_awk="$(command -v awk)"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'printf "awk\\n" >>"%s"\n' "$count_file"
+    printf 'exec "%s" "$@"\n' "$real_awk"
+  } >"$dir/awk"
+  chmod +x "$dir/awk"
+
+  local -a fixtures=() flags=(--no-parallel --simple)
+  for file in 1 2 3; do
+    fixtures[${#fixtures[@]}]="$dir/metadata_${file}_test.sh"
+    printf 'function test_metadata_case_%s() { assert_same same same; }\n' "$file" \
+      >"$dir/metadata_${file}_test.sh"
+  done
+
+  local header=true
+  case "$mode" in
+  no_header) header=false ;;
+  list) flags=(--no-parallel --list) ;;
+  json) flags=(--no-parallel --output json) ;;
+  parallel_simple) flags=(--parallel --simple) ;;
+  parallel_header) flags=(--parallel) ;;
+  esac
+
+  local status=0
+  PATH="$dir:$PATH" BASHUNIT_SHOW_HEADER="$header" ./bashunit --skip-env-file \
+    "${flags[@]}" "${fixtures[@]}" >"$dir/output" 2>&1 || status=$?
+
+  assert_same 0 "$status"
+  assert_same "$expected" "$(wc -l <"$count_file" | tr -d ' ')"
+}
+
+function test_multifile_metadata_scans_with_a_header() {
+  _assert_multifile_metadata_scan_budget header 6
+}
+
+function test_multifile_metadata_scans_without_a_header() {
+  _assert_multifile_metadata_scan_budget no_header 6
+}
+
+function test_multifile_metadata_listing_skips_scans() {
+  _assert_multifile_metadata_scan_budget list 0
+}
+
+function test_multifile_metadata_machine_output_scans() {
+  _assert_multifile_metadata_scan_budget json 6
+}
+
+function test_multifile_metadata_parallel_simple_scans() {
+  _assert_multifile_metadata_scan_budget parallel_simple 6
+}
+
+function test_multifile_metadata_parallel_header_scans() {
+  _assert_multifile_metadata_scan_budget parallel_header 8
+}
+
 function test_run_removes_its_run_output_dir() {
   local dir
   dir="$(bashunit::temp_dir)"
@@ -182,6 +289,120 @@ function test_run_removes_its_run_output_dir() {
   fi
 
   assert_equals 0 "$leftover"
+}
+
+function test_provider_temp_owners_survive_other_rows_cleanup() {
+  local dir
+  dir="$(unset BASHUNIT_CURRENT_TEST_ID; bashunit::temp_dir)"
+  local fixture="$dir/first_test.sh"
+  cat >"$fixture" <<'FIXTURE'
+OWNER_COORD_DIR="$OWNER_PROBE_ROOT/${BASH_SOURCE[0]##*/}"
+
+function set_up_before_script() {
+  mkdir "$OWNER_COORD_DIR"
+  OWNER_SCRIPT_FILE=$(bashunit::temp_file)
+  OWNER_SCRIPT_DIR=$(bashunit::temp_dir)
+  printf '%s\n' "$OWNER_SCRIPT_FILE" "$OWNER_SCRIPT_DIR" >"$OWNER_COORD_DIR/script_paths"
+}
+
+function _wait_for_owner_path() {
+  local path=$1 state=$2 deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    case "$state" in
+    present) [ -f "$path" ] && return 0 ;;
+    absent) [ ! -e "$path" ] && return 0 ;;
+    esac
+    sleep 0.01
+  done
+  assert_same "$state: $path" "timed out waiting for cleanup coordination"
+  return 1
+}
+
+function owner_probe_rows() { printf '%s\n' same same; }
+
+# @data_provider owner_probe_rows
+function test_overlapping_temp_owner_rows() {
+  assert_same same "$1"
+  local row=$_BASHUNIT_RUNNER_RESULT_ORDINAL temp_dir temp_file
+  temp_dir=$(bashunit::temp_dir)
+  temp_file=$(bashunit::temp_file)
+  printf 'still alive\n' >"$temp_file"
+  printf '%s\n' "$BASHUNIT_CURRENT_TEST_ID" "$temp_dir" "$temp_file" >"$OWNER_COORD_DIR/row_$row"
+  : >"$OWNER_COORD_DIR/ready_$row"
+  if [ "$row" -eq 1 ]; then
+    if [ "$OWNER_PROBE_PARALLEL" = true ]; then
+      _wait_for_owner_path "$OWNER_COORD_DIR/ready_2" present || return
+    fi
+    return
+  fi
+
+  _wait_for_owner_path "$OWNER_COORD_DIR/ready_1" present || return
+  local quick_owner quick_dir quick_file
+  {
+    IFS= read -r quick_owner
+    IFS= read -r quick_dir
+    IFS= read -r quick_file
+  } <"$OWNER_COORD_DIR/row_1"
+  _wait_for_owner_path "$quick_dir" absent || return
+  _wait_for_owner_path "$quick_file" absent || return
+  assert_file_not_exists "$quick_file"
+  assert_directory_exists "$temp_dir"
+  assert_file_contains "$temp_file" 'still alive'
+  assert_not_equals "$quick_owner" "$BASHUNIT_CURRENT_TEST_ID"
+  : >"$OWNER_COORD_DIR/late_row_checked"
+}
+
+function tear_down_after_script() {
+  assert_file_exists "$OWNER_SCRIPT_FILE"
+  assert_directory_exists "$OWNER_SCRIPT_DIR"
+  : >"$OWNER_COORD_DIR/script_teardown_checked"
+}
+FIXTURE
+  cp "$fixture" "$dir/second_test.sh"
+
+  local mode parallel strict root output status file path owner first_owner
+  local -a flags
+  for mode in parallel parallel_strict sequential sequential_strict; do
+    root="$dir/$mode"
+    mkdir "$root"
+    parallel=false
+    strict=false
+    flags=(--no-parallel)
+    case "$mode" in
+    parallel*) parallel=true; flags=(--parallel --jobs 2) ;;
+    esac
+    case "$mode" in
+    *_strict) strict=true ;;
+    esac
+    status=0
+    output=$(TMPDIR="$root" OWNER_PROBE_ROOT="$root" OWNER_PROBE_PARALLEL="$parallel" \
+      BASHUNIT_STRICT_MODE="$strict" ./bashunit --skip-env-file --simple "${flags[@]}" \
+      "$fixture" "$dir/second_test.sh" 2>&1) || status=$?
+
+    assert_contains '4 passed' "$output"
+    assert_same 0 "$status"
+    first_owner=""
+    for file in first_test.sh second_test.sh; do
+      assert_file_exists "$root/$file/late_row_checked"
+      assert_file_exists "$root/$file/script_teardown_checked"
+      IFS= read -r owner <"$root/$file/row_1"
+      if [ -n "$first_owner" ]; then
+        assert_not_equals "$first_owner" "$owner"
+      fi
+      first_owner=$owner
+      while IFS= read -r path; do
+        assert_file_not_exists "$path"
+      done <"$root/$file/script_paths"
+      for owner in 1 2; do
+        {
+          IFS= read -r path
+          while IFS= read -r path; do
+            assert_file_not_exists "$path"
+          done
+        } <"$root/$file/row_$owner"
+      done
+    done
+  done
 }
 
 # Regression guard for the parallel per-test result path. Publishing each
@@ -232,15 +453,7 @@ function test_parallel_result_publishing_does_not_fork_per_test() {
   assert_equals "" "$forked"
 }
 
-# Regression guard for the report spool. A worker used to base64 each of the
-# nine fields of a result row separately, and the parent decoded each one the
-# same way -- fourteen `base64` forks per test (and, on the encode side, a `tr`
-# each), so turning on `--log-junit` cost more than running the tests. Only the
-# two fields that can hold arbitrary text need encoding; the rest are a status,
-# some numbers and a path, which a unit separator carries as they are.
-#
-# Counted with a PATH shim rather than a trace: these forks happen inside the
-# `--parallel` workers, which `bash -x` on the parent cannot see.
+# A PATH shim sees codec processes inside workers that the parent trace misses.
 function test_reports_do_not_fork_base64_per_field() {
   if bashunit::check_os::is_windows; then
     bashunit::skip "process tracing is unreliable under Git Bash" && return
@@ -276,11 +489,97 @@ function test_reports_do_not_fork_base64_per_field() {
     calls="$(grep -c . "$count_file" || true)"
   fi
 
-  # Four passing tests carry no failure message and no output, so both
-  # arbitrary fields are empty and short-circuit: the row costs one encode for
-  # the file and one for the test name, and the same two decodes. Sixteen is
-  # that, with room for the run's own bookkeeping; it was 56.
-  assert_less_or_equal_than 16 "$calls"
+  assert_equals 0 "$calls"
+}
+
+function test_parallel_reports_keep_lifecycle_rows_and_remove_scratch_records() {
+  local dir
+  dir="$(bashunit::temp_dir)"
+  mkdir "$dir/a" "$dir/b"
+  printf '%s\n' 'function data_spool_values() { printf "%s\n" "a:b" "a/b"; }
+# @data_provider data_spool_values
+function test_spool_provider_rows() { assert_true true; }
+# @skip intentional
+function test_spool_skip() { assert_same never ran; }
+# @retry 1
+function test_spool_retry() {
+  if [ -f "$REPORT_RETRY_MARKER" ]; then
+    assert_true true
+  else
+    : >"$REPORT_RETRY_MARKER"
+    assert_same first second
+  fi
+}
+# @data_provider undefined_spool_provider
+function test_spool_missing_provider() { assert_same never ran; }
+function tear_down_after_script() { printf "worker teardown failure\n"; return 1; }' >"$dir/a/same_test.sh"
+  printf '%s\n' 'function set_up_before_script() { printf "parent setup failure\n"; return 1; }
+function test_spool_blocked_by_setup() { assert_same never ran; }
+function tear_down_after_script() { printf "parent teardown failure\n"; return 1; }' >"$dir/b/same_test.sh"
+
+  local exit_code=0
+  TMPDIR="$dir" REPORT_RETRY_MARKER="$dir/retried" ./bashunit --skip-env-file --parallel --simple \
+    --report-junit "$dir/out.xml" --report-json "$dir/out.json" --report-tap "$dir/out.tap" \
+    --report-html "$dir/out.html" --report-md "$dir/out.md" --log-gha "$dir/out.gha" \
+    "$dir/a/same_test.sh" "$dir/b/same_test.sh" >"$dir/console" 2>&1 || exit_code=$?
+
+  assert_same 1 "$exit_code"
+  assert_file_contains "$dir/out.json" '"total": 8, "passed": 3, "failed": 4, "skipped": 1'
+  assert_file_contains "$dir/out.json" '"flaky": 1'
+  assert_same 8 "$("$GREP" -c '"name":' "$dir/out.json")"
+  assert_same 8 "$("$GREP" -c '<testcase ' "$dir/out.xml")"
+  assert_file_contains "$dir/out.xml" 'tests="8" failures="4" skipped="1"'
+  assert_file_contains "$dir/out.tap" '1..8'
+  assert_file_contains "$dir/out.html" 'parent setup failure'
+  assert_file_contains "$dir/out.md" '| Failed | 4 |'
+  assert_same 4 "$("$GREP" -c '^::error ' "$dir/out.gha")"
+  assert_same 1 "$("$GREP" -c '^::warning ' "$dir/out.gha")"
+
+  local leftover=0
+  local entry
+  for entry in "$dir/bashunit/run"/*/*; do
+    [ -e "$entry" ] && leftover=$((leftover + 1))
+  done
+  assert_same 0 "$leftover"
+}
+
+function test_provider_arguments_do_not_fork_base64_per_value() {
+  if bashunit::check_os::is_windows; then
+    bashunit::skip "PATH shims are unreliable under Git Bash" && return
+  fi
+
+  local dir
+  dir="$(bashunit::temp_dir)"
+  local count_file="$dir/base64_calls"
+  local real_base64
+  real_base64="$(command -v base64)"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "case \"\$*\" in --help) ;; *) echo x >> \"$count_file\" ;; esac"
+    echo "exec \"$real_base64\" \"\$@\""
+  } >"$dir/base64"
+  chmod +x "$dir/base64"
+
+  local fixture="$dir/provider_forks_test.sh"
+  {
+    echo 'function provide_rows() {'
+    echo '  bashunit::data_set a b'
+    echo '  bashunit::data_set c d'
+    echo '  bashunit::data_set e f'
+    echo '}'
+    echo '# @data_provider provide_rows'
+    echo 'function test_row() { assert_not_empty "$1"; assert_not_empty "$2"; }'
+  } >"$fixture"
+
+  local code=0
+  PATH="$dir:$PATH" ./bashunit --no-parallel "$fixture" >/dev/null 2>&1 || code=$?
+  assert_same 0 "$code"
+
+  local calls=0
+  if [ -f "$count_file" ]; then
+    calls="$(grep -c . "$count_file" || true)"
+  fi
+  assert_equals 0 "$calls"
 }
 
 # Regression guard for the per-test hook path. A test in a file that defines

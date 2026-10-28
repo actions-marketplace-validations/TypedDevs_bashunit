@@ -52,13 +52,6 @@ function bashunit::runner::order_functions_for_script() {
   _BASHUNIT_RUNNER_ORDERED_FNS_OUT="${ordered[*]+${ordered[*]}}"
 }
 
-##
-# Runs the given test functions of a script (sequentially, or one background
-# worker per test under --parallel).
-# Arguments: $1 script path, $2 space-separated test function names, already
-# filter/tag/rerun-filtered by load_test_files (never empty: the caller skips
-# the file when no function survives filtering).
-##
 function bashunit::runner::report_unusable_provider() {
   local test_file="$1"
   local fn_name="$2"
@@ -72,6 +65,14 @@ function bashunit::runner::report_unusable_provider() {
   else
     reason="data provider '$provider' is not defined, so the test never ran"
   fi
+
+  bashunit::runner::report_provider_error "$test_file" "$fn_name" "$reason"
+}
+
+function bashunit::runner::report_provider_error() {
+  local test_file="$1"
+  local fn_name="$2"
+  local reason="$3"
 
   bashunit::state::add_tests_failed
   bashunit::console_results::print_error_test "$fn_name" "$reason"
@@ -95,7 +96,18 @@ function bashunit::runner::report_unusable_provider() {
   fi
 }
 
+function bashunit::runner::run_test_parallel() {
+  _BASHUNIT_REPORTS_RECORD_SCOPE=worker
+  bashunit::runner::run_test "$@"
+}
 
+##
+# Runs the given test functions of a script (sequentially, or one background
+# worker per test under --parallel).
+# Arguments: $1 script path, $2 space-separated test function names, already
+# filter/tag/rerun-filtered by load_test_files (never empty: the caller skips
+# the file when no function survives filtering).
+##
 function bashunit::runner::call_test_functions() {
   local script="$1"
   local cached_functions="${2:-}"
@@ -122,7 +134,8 @@ function bashunit::runner::call_test_functions() {
   local provider_data_count=0
   local -a parsed_data=()
   local parsed_data_count=0
-  # Monotonic within this file; names each parallel worker's .result file.
+  local provider_arg_file=""
+  # Monotonic within this file, including tests executed synchronously.
   local _test_ordinal=0
 
   # Scan the file once; per-test provider lookups below are pure-bash (#763).
@@ -165,11 +178,11 @@ function bashunit::runner::call_test_functions() {
     # No data provider found: run once without forking to capture provider output.
     bashunit::helper::provider_for_function "$fn_name"
     if [ -z "$_BASHUNIT_PROVIDER_FN_OUT" ]; then
+      _test_ordinal=$((_test_ordinal + 1))
+      _BASHUNIT_RUNNER_RESULT_ORDINAL=$_test_ordinal
       if bashunit::parallel::is_enabled && [ "$allow_test_parallel" = true ]; then
         bashunit::runner::wait_for_job_slot
-        _test_ordinal=$((_test_ordinal + 1))
-        _BASHUNIT_RUNNER_RESULT_ORDINAL=$_test_ordinal
-        bashunit::runner::run_test "$script" "$fn_name" &
+        bashunit::runner::run_test_parallel "$script" "$fn_name" &
         _BASHUNIT_WORKER_TEST_PIDS="$_BASHUNIT_WORKER_TEST_PIDS $!"
       else
         bashunit::runner::run_test "$script" "$fn_name"
@@ -201,22 +214,53 @@ function bashunit::runner::call_test_functions() {
       continue
     fi
 
-    # Execute the test function for each line of data
     local data
     for data in "${provider_data[@]+"${provider_data[@]}"}"; do
       parsed_data=()
       parsed_data_count=0
+      local transport_error=""
+      if ! bashunit::env::ensure_run_output_dir; then
+        transport_error="argument storage could not be created"
+      elif [ -z "$provider_arg_file" ] || [ ! -f "$provider_arg_file" ]; then
+        local provider_arg_dir="$_BASHUNIT_RUN_OUTPUT_DIR"
+        case "$provider_arg_dir" in
+        /*) ;;
+        *) provider_arg_dir="$BASHUNIT_WORKING_DIR/$provider_arg_dir" ;;
+        esac
+        provider_arg_file="$("$MKTEMP" "$provider_arg_dir/provider-args.XXXXXXX")" ||
+          transport_error="argument storage could not be created"
+      fi
       local line
-      while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        parsed_data[parsed_data_count]="$(bashunit::helper::decode_base64 "${line}")"
-        parsed_data_count=$((parsed_data_count + 1))
-      done <<<"$(bashunit::runner::parse_data_provider_args "$data")"
-      if bashunit::parallel::is_enabled && [ "$allow_test_parallel" = true ]; then
-        bashunit::runner::wait_for_job_slot
+      # The parser's eval must stay in a subshell so expansions cannot change runner state.
+      if [ -z "$transport_error" ]; then
+        # Bash 3 does not invert a compound command's redirect failure with `!`.
+        if (bashunit::runner::parse_data_provider_args "$data" nul) >"$provider_arg_file"; then
+          if {
+            while IFS= read -r -d '' line; do
+              parsed_data[parsed_data_count]="$line"
+              parsed_data_count=$((parsed_data_count + 1))
+            done
+          } <"$provider_arg_file"; then
+            :
+          else
+            transport_error="arguments could not be read"
+          fi
+        else
+          transport_error="arguments could not be written"
+        fi
+      fi
+      if [ -n "$transport_error" ]; then
         _test_ordinal=$((_test_ordinal + 1))
         _BASHUNIT_RUNNER_RESULT_ORDINAL=$_test_ordinal
-        bashunit::runner::run_test "$script" "$fn_name" ${parsed_data+"${parsed_data[@]}"} &
+        bashunit::runner::report_provider_error \
+          "$script" "$fn_name" "data provider '$_BASHUNIT_PROVIDER_FN_OUT' $transport_error"
+        break
+      fi
+      _test_ordinal=$((_test_ordinal + 1))
+      _BASHUNIT_RUNNER_RESULT_ORDINAL=$_test_ordinal
+      if bashunit::parallel::is_enabled && [ "$allow_test_parallel" = true ]; then
+        bashunit::runner::wait_for_job_slot
+        bashunit::runner::run_test_parallel "$script" "$fn_name" ${parsed_data+"${parsed_data[@]}"} &
         _BASHUNIT_WORKER_TEST_PIDS="$_BASHUNIT_WORKER_TEST_PIDS $!"
       else
         bashunit::runner::run_test "$script" "$fn_name" ${parsed_data+"${parsed_data[@]}"}
@@ -234,6 +278,7 @@ function bashunit::runner::call_test_functions() {
 # Result slots for the timeout-aware execution path (see run_with_timeout).
 _BASHUNIT_RUNNER_EXEC_OUT=""
 _BASHUNIT_RUNNER_TIMED_OUT="false"
+_BASHUNIT_RUNNER_TIMEOUT_MARKER_FILE=""
 # The timeout in force for the test being run: the run-wide setting unless a
 # `# @timeout` annotation overrides it.
 _BASHUNIT_RUNNER_TIMEOUT_SECS=0
@@ -377,6 +422,7 @@ function bashunit::runner::run_with_timeout() {
   out_file="$("$MKTEMP" "$tmp_dir/bashunit_timeout_out.XXXXXXX")"
   marker_file="$("$MKTEMP" "$tmp_dir/bashunit_timeout_marker.XXXXXXX")"
   rm -f "$marker_file"
+  local _BASHUNIT_RUNNER_TIMEOUT_MARKER_FILE="$marker_file"
 
   # Both jobs run in their own process group (set -m) so each can be killed as a
   # whole tree. The body MUST run in an explicit ( ) subshell: a backgrounded { }
@@ -419,6 +465,8 @@ function bashunit::runner::run_with_timeout() {
     # that outlived a missed teardown (see below) would mark an already-finished
     # fast test as timed out.
     kill -0 "$test_pid" 2>/dev/null || exit 0
+    # Cancellation must leave the watchdog alive once cleanup needs its KILL bound.
+    trap '' TERM
     : >"$marker_file"
     kill -TERM -"$test_pid" 2>/dev/null
     # Poll for the body to go instead of sleeping a flat window. The TERM has to
