@@ -12,6 +12,9 @@ on:
     branches:
       - main
 
+env:
+  BASHUNIT_NO_NETWORK: 'true'
+
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -208,7 +211,6 @@ jobs:
 
   windows-acceptance:
     name: "Windows - acceptance"
-    if: github.event_name == 'push'
     timeout-minutes: 10
     runs-on: windows-latest
     strategy:
@@ -243,8 +245,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "sequential"
-            command: "make test"
           - name: "parallel simple"
             command: "./bashunit --parallel --simple tests/"
           - name: "parallel extended"
@@ -280,4 +280,4 @@ jobs:
             apk add --no-cache bash make git jq && \
             adduser -D builder && \
             chown -R builder /project && \
-            su - builder -c 'cd /project; ${{ matrix.command }}';"
+            su - builder -c 'cd /project; BASHUNIT_NO_NETWORK=true ${{ matrix.command }}';"

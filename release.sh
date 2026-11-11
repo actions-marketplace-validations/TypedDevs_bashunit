@@ -193,14 +193,14 @@ function release::preflight::check_branch_main() {
 }
 
 function release::preflight::check_network() {
-  release::log_verbose "Checking network connectivity..."
-  if ! curl --silent --head --fail --max-time 5 https://github.com >/dev/null 2>&1; then
+  release::log_verbose "Checking GitHub API access..."
+  if ! gh api "repos/${GITHUB_REPO_PATH}" >/dev/null 2>&1; then
     release::error_with_suggestion \
-      "Cannot reach github.com" \
-      "Check your network connection"
+      "Cannot access GitHub API for ${GITHUB_REPO_PATH}" \
+      "Check your network connection and GitHub repository access"
     return 1
   fi
-  release::log_verbose "Network connectivity OK"
+  release::log_verbose "GitHub API access OK"
   return 0
 }
 
@@ -547,7 +547,7 @@ function release::sandbox::run() {
   # Commit changes (confirmations skipped in sandbox)
   release::log_info "Creating release commit..."
   git add "${RELEASE_FILES[@]}"
-  git commit -m "release: $VERSION" -n
+  git commit -m "release: $VERSION"
   release::log_success "Created commit"
   # Annotated + inline message: gpgsign-safe and never opens an editor.
   git tag -a -m "$VERSION" "$VERSION"
@@ -945,7 +945,7 @@ function release::git_commit_and_tag() {
   fi
 
   git add "${RELEASE_FILES[@]}"
-  git commit -m "release: $new_version" -n
+  git commit -m "release: $new_version"
   release::log_success "Created commit"
 
   local major_tag

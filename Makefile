@@ -46,7 +46,8 @@ help:
 	@echo "Usage: make [command]"
 	@echo ""
 	@echo "Commands:"
-	@echo "  test                     Run the tests"
+	@echo "  test                     Run the tests sequentially"
+	@echo "  test/parallel            Run the tests in parallel (much faster)"
 	@echo "  test/list                List all tests under the tests directory"
 	@echo "  test/watch               Automatically run tests every second"
 	@echo "  docker/alpine            Run into a Docker Linux/Alpine:latest image"
@@ -137,9 +138,12 @@ ifndef STATIC_ANALYSIS_CHECKER
 else
 	@{ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
 		git ls-files -z --cached --others --exclude-standard \
-			"*.sh" bashunit bin/pre-commit; \
+			"*.sh" "*.bash" bashunit bin/pre-commit \
+			':(exclude)tests/acceptance/fixtures/test_bashunit_when_syntax_error.bash'; \
 	else \
-		find . -name "*.sh" -not -path "./local/*" -not -path "./.claude/worktrees/*" -print0; \
+		find . \( -name "*.sh" -o -name "*.bash" \) \
+			-not -path "./tests/acceptance/fixtures/test_bashunit_when_syntax_error.bash" \
+			-not -path "./local/*" -not -path "./.claude/worktrees/*" -print0; \
 	fi; } \
 		| xargs -0 -n 1 -P 4 shellcheck -xC -e SC1091 -e SC2155 -e SC2016 \
 		&& printf "\e[1m\e[32m%s\e[0m\n" "ShellCheck: OK!"

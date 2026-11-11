@@ -1,8 +1,8 @@
 ---
 name: release
-description: Run pre-release validation and execute the release process
+description: Use to publish a release after pre-release checks pass.
 argument-hint: "[version]"
-allowed-tools: shell, read, Grep, Glob
+allowed-tools: [shell, read, Grep, Glob]
 ---
 
 # Release

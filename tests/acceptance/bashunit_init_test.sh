@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2317
 
-# This file must keep exactly ONE skipped test. bashunit_summary_output_test.sh
-# runs it to demonstrate --show-skipped and asserts the wording "There was 1
-# skipped test:", so a second skip turns that into "There were 2" and fails.
-#
-# A conditional skip is the dangerous kind: a permission test set up with
-# `chmod 000` is a no-op for root, so it runs locally and skips only on the
-# Bash 3.0 CI image -- green here, five jobs red there (#1264). Put those in
-# their own file; bashunit_bootstrap_diagnosis_test.sh exists for that.
-
 set -euo pipefail
 
 BASHUNIT_PATH="$PWD/bashunit"
@@ -64,8 +55,24 @@ function test_bashunit_init_updates_env() {
   assert_file_exists "custom/example_test.sh"
   assert_file_exists "custom/bootstrap.sh"
   assert_file_contains .env "#BASHUNIT_BOOTSTRAP=old/bootstrap.sh"
-  assert_file_contains .env "BASHUNIT_BOOTSTRAP=custom/bootstrap.sh"
+  assert_file_contains .env 'BASHUNIT_BOOTSTRAP="custom/bootstrap.sh"'
   popd >/dev/null
+}
+
+# A directory with a space is a valid project directory. `.env` is sourced as
+# shell, so an unquoted BASHUNIT_BOOTSTRAP turns the second word into a command
+# and the next run dies with "No such file or directory" naming a path the user
+# never typed.
+function test_bashunit_init_with_a_space_in_the_directory_runs_afterwards() {
+  pushd "$TMP_DIR" >/dev/null
+  "$BASHUNIT_PATH" init "my tests" >/dev/null
+
+  local output
+  output="$($BASHUNIT_PATH --no-color 2>&1)"
+  popd >/dev/null
+
+  assert_not_contains "No such file or directory" "$output"
+  assert_contains "1 passed" "$output"
 }
 
 # `bashunit init` is run more than once in practice -- re-scaffolding, or a
@@ -272,4 +279,38 @@ function test_a_healthy_env_flag_file_still_loads() {
 
   assert_same 0 "$ec"
   assert_contains "1 passed" "$output"
+}
+
+function provide_workflow_directories_with_whitespace() {
+  bashunit::data_set 'my tests'
+  bashunit::data_set $'my\ttests'
+  bashunit::data_set $'my\t${{ github.repository }}'
+  bashunit::data_set "my tests'\"; touch injected; #"
+}
+
+# @data_provider provide_workflow_directories_with_whitespace
+function test_generated_workflow_runs_the_whole_directory_without_an_env_file() {
+  local directory=$1 command output code=0
+  (cd "$TMP_DIR" && "$BASHUNIT_PATH" init "$directory") >/dev/null
+  command=$(awk '/^        run: \|$/ { getline; sub(/^          /, ""); print; exit }' \
+    "$TMP_DIR/.github/workflows/tests.yml")
+  assert_not_empty "$command"
+  assert_file_not_contains "$TMP_DIR/.github/workflows/tests.yml" '${{'
+  if [ -z "$command" ]; then
+    return
+  fi
+  mkdir -p "$TMP_DIR/lib"
+  printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$BASHUNIT_PATH" >"$TMP_DIR/lib/bashunit"
+  chmod +x "$TMP_DIR/lib/bashunit"
+  rm "$TMP_DIR/.env"
+  output=$(cd "$TMP_DIR" && bash -c "$command" 2>&1) || code=$?
+  assert_same 0 "$code"
+  assert_contains '1 passed' "$output"
+  assert_file_not_exists "$TMP_DIR/injected"
+}
+
+function test_generated_workflow_keeps_the_existing_args_for_a_simple_directory() {
+  (cd "$TMP_DIR" && "$BASHUNIT_PATH" init custom) >/dev/null
+  assert_file_contains "$TMP_DIR/.github/workflows/tests.yml" '          args: custom'
+  assert_file_not_contains "$TMP_DIR/.github/workflows/tests.yml" '        run: |'
 }

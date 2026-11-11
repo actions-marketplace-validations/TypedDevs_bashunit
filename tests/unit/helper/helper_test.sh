@@ -130,6 +130,34 @@ function test_check_duplicate_functions_with_duplicates() {
   assert_general_error "$(bashunit::helper::check_duplicate_functions "$file")"
 }
 
+function test_check_duplicate_functions_with_the_brace_on_the_next_line() {
+  local file detail
+  file="$(bashunit::temp_file duplicate_next_line).sh"
+  printf 'function %s()\n{\n  :\n}\nfunction %s()\n{\n  :\n}\n' \
+    test_twice test_twice >"$file"
+
+  assert_general_error "$(bashunit::helper::check_duplicate_functions "$file")"
+
+  detail=$(
+    bashunit::helper::check_duplicate_functions "$file" >/dev/null 2>&1 || true
+    bashunit::state::get_duplicated_function_details
+  )
+  assert_contains "test_twice (lines 1, 5)" "$detail"
+}
+
+function test_check_duplicate_functions_with_a_comment_before_the_brace() {
+  local file detail
+  file="$(bashunit::temp_file duplicate_comment_line).sh"
+  printf 'function %s() # first\n{\n  :\n}\nfunction %s() # second\n{\n  :\n}\n' \
+    test_twice test_twice >"$file"
+
+  detail=$(
+    bashunit::helper::check_duplicate_functions "$file" >/dev/null 2>&1 || true
+    bashunit::state::get_duplicated_function_details
+  )
+  assert_contains "test_twice (lines 1, 5)" "$detail"
+}
+
 function test_check_duplicate_functions_without_duplicates() {
   local file
   file="$(bashunit::current_dir)/../fixtures/no_duplicate_functions.sh"
@@ -423,6 +451,20 @@ function test_to_run_with_filter_matching_string_in_function_name() {
 
   assert_same "test_my_awesome_function test_your_awesome_function" \
     "$(bashunit::helper::get_functions_to_run "test" "awesome" "${functions[*]}")"
+}
+
+function test_filters_strip_only_a_leading_test_prefix() {
+  local functions filter
+  functions=(test_latest_version test_other)
+  for filter in latest_version test_latest_version version; do
+    assert_same test_latest_version "$(bashunit::helper::get_functions_to_run test "$filter" "${functions[*]}")"
+  done
+
+  BASHUNIT_EXCLUDE_FILTER=latest_version
+  assert_same test_other "$(bashunit::helper::get_functions_to_run test '' "${functions[*]}")"
+  BASHUNIT_EXCLUDE_FILTER=''
+  _BASHUNIT_CLI_EXCLUDE_FILTERS=(latest_version)
+  assert_same test_other "$(bashunit::helper::get_functions_to_run test '' "${functions[*]}")"
 }
 
 function test_interpolate_fn_name() {
@@ -833,73 +875,38 @@ function test_find_total_tests_sources_a_file_that_defines_functions_dynamically
 }
 
 function test_parse_file_path_filter_plain_path() {
-  local result
-  result=$(bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh") || true
+  bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh"
 
-  local file_path filter
-  {
-    read -r file_path || true
-    read -r filter || true
-  } <<<"$result"
-
-  assert_same "tests/unit/example_test.sh" "$file_path"
-  assert_same "" "$filter"
+  assert_same "tests/unit/example_test.sh" "$_BASHUNIT_HELPER_PARSED_PATH_OUT"
+  assert_same "" "$_BASHUNIT_HELPER_PARSED_FILTER_OUT"
 }
 
 function test_parse_file_path_filter_with_double_colon() {
-  local result
-  result=$(bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh::test_my_function") || true
+  bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh::test_my_function"
 
-  local file_path filter
-  {
-    read -r file_path || true
-    read -r filter || true
-  } <<<"$result"
-
-  assert_same "tests/unit/example_test.sh" "$file_path"
-  assert_same "test_my_function" "$filter"
+  assert_same "tests/unit/example_test.sh" "$_BASHUNIT_HELPER_PARSED_PATH_OUT"
+  assert_same "test_my_function" "$_BASHUNIT_HELPER_PARSED_FILTER_OUT"
 }
 
 function test_parse_file_path_filter_with_line_number() {
-  local result
-  result=$(bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh:42") || true
+  bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh:42"
 
-  local file_path filter
-  {
-    read -r file_path || true
-    read -r filter || true
-  } <<<"$result"
-
-  assert_same "tests/unit/example_test.sh" "$file_path"
-  assert_same "__line__:42" "$filter"
+  assert_same "tests/unit/example_test.sh" "$_BASHUNIT_HELPER_PARSED_PATH_OUT"
+  assert_same "__line__:42" "$_BASHUNIT_HELPER_PARSED_FILTER_OUT"
 }
 
 function test_parse_file_path_filter_colon_followed_by_non_number() {
-  local result
-  result=$(bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh:foo") || true
+  bashunit::helper::parse_file_path_filter "tests/unit/example_test.sh:foo"
 
-  local file_path filter
-  {
-    read -r file_path || true
-    read -r filter || true
-  } <<<"$result"
-
-  assert_same "tests/unit/example_test.sh:foo" "$file_path"
-  assert_same "" "$filter"
+  assert_same "tests/unit/example_test.sh:foo" "$_BASHUNIT_HELPER_PARSED_PATH_OUT"
+  assert_same "" "$_BASHUNIT_HELPER_PARSED_FILTER_OUT"
 }
 
 function test_parse_file_path_filter_with_colon_in_path() {
-  local result
-  result=$(bashunit::helper::parse_file_path_filter "/path/to:weird/example_test.sh::test_func") || true
+  bashunit::helper::parse_file_path_filter "/path/to:weird/example_test.sh::test_func"
 
-  local file_path filter
-  {
-    read -r file_path || true
-    read -r filter || true
-  } <<<"$result"
-
-  assert_same "/path/to:weird/example_test.sh" "$file_path"
-  assert_same "test_func" "$filter"
+  assert_same "/path/to:weird/example_test.sh" "$_BASHUNIT_HELPER_PARSED_PATH_OUT"
+  assert_same "test_func" "$_BASHUNIT_HELPER_PARSED_FILTER_OUT"
 }
 
 function test_find_function_at_line_first_function() {
@@ -1036,4 +1043,18 @@ function test_no_exclude_filter_keeps_previous_behaviour() {
 
   assert_same "prefix_alpha prefix_beta" \
     "$(_with_exclude_filter "" "prefix" "" "${functions[*]}")"
+}
+
+function test_duplicate_keyword_only_definitions_are_reported() {
+  local file fn=test_duplicate_without_parens
+  file="$(bashunit::temp_file)"
+  printf 'function %s { :; }\nfunction %s\n{ :; }\n' "$fn" "$fn" >"$file"
+  assert_general_error "$(bashunit::helper::check_duplicate_functions "$file")"
+}
+
+function test_duplicate_definitions_with_comments_and_subshell_bodies_are_reported() {
+  local file fn=test_duplicate_body_forms
+  file="$(bashunit::temp_file)"
+  printf 'function %s () # a note\n{ :; }\n%s() ( : )\n' "$fn" "$fn" >"$file"
+  assert_general_error "$(bashunit::helper::check_duplicate_functions "$file")"
 }

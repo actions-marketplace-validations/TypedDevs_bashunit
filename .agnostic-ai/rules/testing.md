@@ -4,7 +4,7 @@ scope: tests
 
 # Testing
 
-Read sibling tests before writing a new fixture. Repository paths are relative to the repository root.
+Read sibling tests before writing a new fixture.
 
 | Layer | Directory | Scope |
 |-------|-----------|-------|
@@ -12,11 +12,11 @@ Read sibling tests before writing a new fixture. Repository paths are relative t
 | Functional | `tests/functional/` | Real component interactions |
 | Acceptance | `tests/acceptance/` | CLI and end-to-end behavior |
 
-Files end in `_test.sh`; name tests for the behavior and trigger. Use targeted RED/GREEN checks during implementation, then the root quality gate once the complete change set is ready. Test success, failure and cleanup paths that the change affects; verify parallel behavior when state or workers change.
+Files end in `_test.sh`; name tests for the behavior and trigger. Select validation under `.agnostic-ai/AGNOSTIC_AI.md` when the change set is complete. Test success, failure and cleanup paths that the change affects; verify parallel behavior when state or workers change.
 
 ## Assertions and doubles
 
-Assertions are bare functions (`assert_equals`, `assert_same`, `assert_contains`, `assert_not_contains`, `assert_successful_code`, `assert_general_error`, `assert_file_exists`, `assert_file_not_exists`). Helpers and doubles use `bashunit::*`. Inspect the matching assertion before guessing its signature. There is no `assert_fails`.
+Assertions are bare functions (`assert_equals`, `assert_same`, `assert_contains`, `assert_not_contains`, `assert_successful_code`, `assert_general_error`, `assert_file_exists`, `assert_file_not_exists`). Helpers and doubles use `bashunit::*`. Read the assertion before guessing its signature. There is no `assert_fails`.
 
 ```bash
 bashunit::spy function_name
@@ -41,6 +41,6 @@ Use `assert_match_snapshot` or `assert_match_named_snapshot`; update snapshots d
 - Use `$(bashunit::temp_file)` or `$(bashunit::temp_dir)` for framework-cleaned fixtures. No shared fixed temporary paths or global state between tests.
 - Mock network calls and nondeterministic external dependencies. Tests must work under `./bashunit --parallel tests/`.
 - Embedded test-function definitions are scanned textually by the duplicate check, even inside strings. Give every embedded definition a unique name across its containing file; quote-state heuristics cannot safely hide them.
-- Strict CI uses `set -euo pipefail`: initialize arrays, guard optional elements, use `if` for conditional side effects, and isolate `extdebug` in a subshell. Simple output contains markers, so test rendering helpers rather than assuming full `print_line` output.
+- Strict CI (`make test/strict`) uses `set -euo pipefail`: initialize arrays, guard optional elements, use `if` for conditional side effects, and isolate `extdebug` in a subshell. Simple output contains markers, so test rendering helpers rather than assuming full `print_line` output.
 
 Start with `tests/unit/assert/`, `tests/functional/doubles_test.sh`, `tests/functional/provider_test.sh`, `tests/unit/runner/hooks_test.sh`, and `tests/acceptance/bashunit_test.sh`. Use `rg` to locate the matching function tests before adding a pattern.
